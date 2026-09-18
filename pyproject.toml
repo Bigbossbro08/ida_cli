@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ida-cli"
+version = "0.1.0"
+description = "Fast, lightweight CLI for IDA Pro with zero-config instance discovery"
+readme = "README.md"
+authors = [
+    { name = "Developer" }
+]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+ida-cli = "ida_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ida_cli*"]
