@@ -34,6 +34,18 @@ $ ida-cli decompile here
      └─ Formats clean C pseudocode / JSON output
 ```
 
+## Install the IDA-side connector
+
+```powershell
+pip install -e .
+ida-cli install          # copies the plugin into IDA's user plugins dir
+ida-cli doctor           # verify: check for "instances" after restarting IDA
+```
+
+`ida-cli install` copies `plugin/ida_cli_plugin.py` + `plugin/ida_cli_server.py`
+into `%APPDATA%\Hex-Rays\IDA Pro\plugins` and writes an `ida_cli_path.pth` so
+the `ida_cli` package is importable from inside IDA. Restart IDA afterward.
+
 ## Quick Start
 
 ```powershell
@@ -98,7 +110,8 @@ ida-cli decompile 0x401000 --json
 | `callees` | Get functions called by target (defaults to `here`) |
 | `lookup` | Look up functions by name pattern or address |
 | `funcs` | List and search functions with pagination and filtering |
-| `inspect` | High-density function inspection summary card (defaults to `here`) |
+| `inspect` | High-density function inspection summary card (defaults to `here`; `--chunks` for `.text$x` tails) |
+| `analyze` | Composite function analysis: pseudocode, strings, constants, callers/callees, blocks |
 | `search` | Search text/regex in disassembly or comments |
 | `bytes` | Read raw bytes from memory (defaults to `here`) |
 | `patch` | Patch memory bytes at address |
@@ -108,6 +121,13 @@ ida-cli decompile 0x401000 --json
 | `survey` | High-level binary survey overview |
 | `save` | Save active IDB database |
 | `py` | Evaluate Python expression via `py_eval` |
+| `exec-file` | Execute a Python script file inside IDA (full IDAPython namespace) |
+| `serve` | Run an MCP transport bridge to IDA (`--stdio` for Claude Desktop/Cursor) |
+| `doctor` | Diagnose environment, dependencies, and live instances |
+| `mcp-config` | Emit an MCP client config (`--mode stdio` native, or `--mode proxy`) |
+| `install` | Install the connector plugin into IDA Pro's plugins directory |
+| `uninstall` | Remove the connector plugin from IDA Pro |
+| `install-paths` | Show resolved plugin install paths |
 
 ## Plugin Architecture
 
@@ -167,3 +187,33 @@ ida-cli run basic_blocks -p addrs=0x401000 -p max_blocks=10
 # Or pass complex parameters as raw JSON
 ida-cli run rename --json-params '{"batch": [{"kind": "func", "addr": "0x401000", "new_name": "MyFunc"}]}'
 ```
+
+## MCP Endpoint
+
+The connector also exposes a JSON-RPC MCP endpoint so MCP clients can use ida-cli
+directly (full tool schemas, resources, and cancellation were added in Phase 2):
+
+```powershell
+# stdio bridge for Claude Desktop / Cursor (add as an MCP server command)
+ida-cli serve --stdio
+```
+
+- `POST /mcp` — JSON-RPC MCP (`initialize`, `tools/list`, `tools/call`,
+  `resources/list|templates|read`, `notifications/*`). Replies carry an
+  `Mcp-Session-Id` header.
+- `GET /output/<id>.<ext>` — downloads the full payload when a response was
+  size-limited (the CLI prints a hint with this URL).
+- Matcher-compatible routes (same API as the legacy `:28000` matcher server):
+  `GET /func`, `/funcs`, `/data`, `/datas`, `/all_names`, `/baseline`,
+  `/refresh`, `/synthetic_obj`. The matcher resolves this connector
+  automatically (`IDA_MATCHER_URL` to pin an instance).
+
+### Note on the name
+
+There is an unrelated project also called `ida-cli` (cpkt9762/ida-cli) that
+uses `--path` / `raw` / `pipe` / `serve-http`. This tool is the rogan2/ida_cli
+connector and rejects those flags with a clear error.
+
+Large responses are truncated shape-preservingly (default >50,000 chars; tune
+with `IDA_CLI_OUTPUT_LIMIT_CHARS`). Set `IDA_CLI_QUIET=1` to silence the hint.
+`exec-file` runs project IDAPython scripts with the full `ida_*` namespace.

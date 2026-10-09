@@ -15,10 +15,19 @@ try:
     try:
         from ida_cli import server as ida_cli_server
     except ImportError:
-        # Fallback if ida_cli is not in global sys.path
-        repo_path = Path("D:/repos/ida_cli")
-        if str(repo_path) not in sys.path:
-            sys.path.insert(0, str(repo_path))
+        # Fallback: add candidate roots to sys.path then retry. Avoids any
+        # machine-specific hardcoding; `ida-cli install` also drops a .pth.
+        candidates = []
+        if os.environ.get("IDA_CLI_ROOT"):
+            candidates.append(os.environ["IDA_CLI_ROOT"])
+        try:
+            candidates.append(str(Path(__file__).resolve().parents[1]))
+        except Exception:
+            pass
+        candidates.append(str(Path.home() / ".ida-cli" / "repo"))
+        for root in candidates:
+            if root and str(root) not in sys.path:
+                sys.path.insert(0, str(root))
         from ida_cli import server as ida_cli_server
 
     class IdaCliIDBHooks(ida_idp.IDB_Hooks):
@@ -28,6 +37,15 @@ try:
         def savebase(self):
             if ida_cli_server._server_port:
                 ida_cli_server.update_instance_heartbeat(ida_cli_server._server_port)
+
+        # The descriptor is first written before the IDB is named. In headless
+        # (idat) mode no GUI event loop runs, so the heartbeat timer never
+        # fires; these hooks refresh the descriptor once the IDB/input is known.
+        def renamed(self, *_args):
+            ida_cli_server.refresh_instance_info()
+
+        def updated(self, *_args):
+            ida_cli_server.refresh_instance_info()
 
     class IdaCliPlugin(ida_idaapi.plugin_t):
         flags = ida_idaapi.PLUGIN_KEEP | ida_idaapi.PLUGIN_FIX

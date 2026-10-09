@@ -6,11 +6,16 @@ and matches instances based on PID, port, or current working directory.
 
 import json
 import os
+import socket
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+
+class AmbiguousInstanceError(Exception):
+    """Raised when several IDA instances are reachable and no target was given."""
 
 
 @dataclass
@@ -34,10 +39,16 @@ class IdaInstance:
 
     @property
     def idb_name(self) -> str:
-        if self.idb_path:
-            return Path(self.idb_path).name
-        if self.input_file:
-            return Path(self.input_file).name
+        # Prefer the IDB path; else derive from the input binary; else the
+        # descriptor's slug (works in headless mode where idb_path is empty).
+        for candidate in (self.idb_path, self.input_file):
+            if candidate:
+                return Path(candidate).name
+        if self.file_path is not None:
+            stem = Path(self.file_path).stem
+            parts = stem.split("_")
+            if len(parts) > 3:
+                return "_".join(parts[3:])
         return "Untitled"
 
 
@@ -69,49 +80,86 @@ def is_pid_alive(pid: int) -> bool:
             return True
 
 
+def probe_instance(host: str, port: int, timeout: float = 0.5) -> bool:
+    """Return True if a TCP connection to host:port can be established quickly.
+
+    Used as a secondary liveness check so a descriptor whose process is alive
+    (or whose PID was recycled) but whose connector crashed is not trusted.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def get_instances_dir() -> Path:
-    instances_dir = Path.home() / ".ida-cli" / "instances"
+    override = os.environ.get("IDA_CLI_INSTANCES_DIR")
+    instances_dir = Path(override) if override else (Path.home() / ".ida-cli" / "instances")
     instances_dir.mkdir(parents=True, exist_ok=True)
     return instances_dir
 
 
 def list_instances(prune_dead: bool = True) -> List[IdaInstance]:
-    """Scans ~/.ida-cli/instances/ and returns active instances."""
+    """Scans ~/.ida-cli/instances/ and returns reachable, live instances.
+
+    A descriptor is discarded (and its file removed when ``prune_dead``) when it
+    cannot be parsed or its PID is no longer alive. A descriptor whose PID is
+    alive but whose connector port does not accept connections is skipped but
+    left on disk, so a temporarily busy IDA is not forgotten.
+    """
     instances_dir = get_instances_dir()
     instances = []
 
     for file_path in instances_dir.glob("*.json"):
         try:
             data = json.loads(file_path.read_text(encoding="utf-8"))
-            pid = data.get("pid", 0)
-            port = data.get("port", 0)
-
-            # Check if process is still alive
-            if not is_pid_alive(pid):
-                if prune_dead:
-                    try:
-                        file_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                continue
-
-            instance = IdaInstance(
-                pid=pid,
-                port=port,
-                idb_path=data.get("idb_path", ""),
-                input_file=data.get("input_file", ""),
-                root_dir=data.get("root_dir", ""),
-                status=data.get("status", "unknown"),
-                ida_version=data.get("ida_version", "unknown"),
-                current_ea=data.get("current_ea", "0x0"),
-                started_at=data.get("started_at", 0),
-                last_heartbeat=data.get("last_heartbeat", 0),
-                file_path=file_path,
-            )
-            instances.append(instance)
+            if not isinstance(data, dict):
+                raise ValueError("descriptor is not a JSON object")
+            pid = int(data.get("pid", 0) or 0)
+            port = int(data.get("port", 0) or 0)
+            if pid <= 0 or port <= 0:
+                raise ValueError("descriptor missing pid/port")
         except Exception:
-            # Malformed JSON or read error
+            # Corrupt or malformed descriptor (e.g. zero-filled after a crash):
+            # remove it so it can never poison instance resolution.
+            if prune_dead:
+                _safe_unlink(file_path)
             continue
+
+        # Dead process: the descriptor is stale.
+        if not is_pid_alive(pid):
+            if prune_dead:
+                _safe_unlink(file_path)
+            continue
+
+        # Alive process but the connector is not accepting connections: skip it
+        # (do not delete) so the instance can recover once it is responsive.
+        if not probe_instance("127.0.0.1", port):
+            continue
+
+        instances.append(IdaInstance(
+            pid=pid,
+            port=port,
+            idb_path=data.get("idb_path", ""),
+            input_file=data.get("input_file", ""),
+            # Note: root_dir here is the descriptor's stored value; callers that
+            # need the input-file directory should use input_file.
+            root_dir=data.get("root_dir", ""),
+            status=data.get("status", "unknown"),
+            ida_version=data.get("ida_version", "unknown"),
+            current_ea=data.get("current_ea", "0x0"),
+            started_at=data.get("started_at", 0),
+            last_heartbeat=data.get("last_heartbeat", 0),
+            file_path=file_path,
+        ))
 
     # Deduplicate by (pid, port): keep newest, prune older descriptor files for the same process
     instances.sort(key=lambda inst: inst.last_heartbeat, reverse=True)
@@ -121,10 +169,7 @@ def list_instances(prune_dead: bool = True) -> List[IdaInstance]:
         key = (inst.pid, inst.port)
         if key in seen_endpoints:
             if prune_dead and inst.file_path:
-                try:
-                    inst.file_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                _safe_unlink(inst.file_path)
             continue
         seen_endpoints.add(key)
         deduped.append(inst)
@@ -140,7 +185,8 @@ def resolve_instance(target: Optional[str] = None, cwd: Optional[Path] = None) -
     2. Direct match by PID (e.g. "37000")
     3. Match by IDB filename or stem (e.g. "age2_x1")
     4. Match by current working directory (CWD matches IDB root_dir)
-    5. Single active instance fallback
+    5. Single reachable instance fallback
+    6. Otherwise raise AmbiguousInstanceError (never silently pick one).
     """
     instances = list_instances(prune_dead=True)
     if not instances:
@@ -180,12 +226,20 @@ def resolve_instance(target: Optional[str] = None, cwd: Optional[Path] = None) -
             if cwd_str == inst_root or cwd_str.startswith(inst_root + os.sep) or inst_root.startswith(cwd_str + os.sep):
                 return inst
 
-    # 5: Single active instance fallback
+    # 5: Single reachable instance fallback
     if len(instances) == 1:
         return instances[0]
 
-    # If multiple instances exist and none matched CWD, return the most recently updated one
-    return instances[0]
+    # 6: Several reachable instances and nothing matched the CWD. Refuse to
+    # guess: silently targeting the wrong database is worse than failing.
+    candidates = ", ".join(
+        f"{inst.idb_name} (pid={inst.pid}, port={inst.port})" for inst in instances
+    )
+    raise AmbiguousInstanceError(
+        "Multiple IDA instances are running and none matches the current "
+        "directory. Select one with -i/--instance by port, PID, or IDB name. "
+        f"Candidates: {candidates}"
+    )
 
 
 def find_ida_executable(headless: bool = False) -> Optional[Path]:

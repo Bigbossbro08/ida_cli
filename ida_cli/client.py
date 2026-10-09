@@ -5,6 +5,7 @@ Uses standard library urllib for zero-dependency reliability.
 """
 
 import json
+import os
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
@@ -15,11 +16,18 @@ class IdaClientError(Exception):
     pass
 
 
+# The server-side tool budget defaults to 60s (IDA_CLI_TOOL_TIMEOUT_SEC); the
+# HTTP timeout must exceed it so a cancelled tool reports a clean error instead
+# of the client hanging up first.
+_DEFAULT_TIMEOUT_SEC = float(os.environ.get("IDA_CLI_HTTP_TIMEOUT_SEC", "120") or 120)
+
+
 class IdaClient:
-    def __init__(self, instance: IdaInstance, timeout: float = 30.0):
+    def __init__(self, instance: IdaInstance, timeout: Optional[float] = None):
         self.instance = instance
         self.base_url = f"http://127.0.0.1:{instance.port}"
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else _DEFAULT_TIMEOUT_SEC
+        self.last_output_meta: Optional[Dict[str, Any]] = None
 
     def _request(self, path: str, method: str = "GET", data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
@@ -77,6 +85,17 @@ class IdaClient:
             if tb:
                 raise IdaClientError(f"{err}\n--- IDA Server Traceback ---\n{tb.strip()}")
             raise IdaClientError(err)
+        self.last_output_meta = resp.get("_output")
+        if (
+            isinstance(self.last_output_meta, dict)
+            and self.last_output_meta.get("truncated")
+            and not os.environ.get("IDA_CLI_QUIET")
+        ):
+            import sys
+            print(
+                f"[ida-cli] output truncated; full result: {self.last_output_meta.get('download_url')}",
+                file=sys.stderr,
+            )
         return resp.get("data", {})
 
     def describe_command(self, name: str) -> Optional[Dict[str, Any]]:

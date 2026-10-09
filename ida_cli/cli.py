@@ -11,8 +11,16 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import __version__
 from .client import IdaClient, IdaClientError
-from .discovery import find_ida_executable, is_pid_alive, list_instances, resolve_instance
+from .discovery import (
+    AmbiguousInstanceError,
+    find_ida_executable,
+    get_instances_dir,
+    is_pid_alive,
+    list_instances,
+    resolve_instance,
+)
 from .plugins import register_cli_plugins, resolve_open_target
 
 # Ensure UTF-8 output on Windows consoles
@@ -49,7 +57,12 @@ def format_instance_table(instances) -> str:
 
 
 def get_client(target=None) -> IdaClient:
-    instance = resolve_instance(target=target)
+    try:
+        instance = resolve_instance(target=target)
+    except AmbiguousInstanceError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print("Run `ida-cli instances` to list them, then pass -i <port|pid|name>.", file=sys.stderr)
+        sys.exit(2)
     if not instance:
         print("Error: No active IDA Pro instance found.", file=sys.stderr)
         print("Make sure IDA Pro is running with the ida_cli_plugin loaded.", file=sys.stderr)
@@ -162,15 +175,19 @@ def cmd_locals(args):
 
 def cmd_vtable(args):
     client = get_client(args.instance)
-    res = client.run_command("vtable_list", {"target": args.target, "limit": args.limit})
+    params = {"target": args.target, "limit": args.limit, "scan": getattr(args, "scan", False)}
+    res = client.run_command("vtable_list", params)
     if args.json:
         print(json.dumps(res, indent=2))
     else:
         print(f"Vtable @ {res.get('vtable_ea')} for '{res.get('target')}' ({res.get('slot_count')} slots, ptr_size={res.get('ptr_size')})")
+        rtti = res.get("rtti")
+        if rtti:
+            print(f"RTTI COL:   {rtti.get('ea')}  {rtti.get('name')}")
         print(f"  {'IDX':<5} {'OFFSET':<10} {'FUNC EA':<14} {'NAME'}")
         print("  " + "-" * 80)
         for s in res.get("slots", []):
-            print(f"  {s.get('index'):<5} {s.get('vtable_offset'):<10} {s.get('fn_ea'):<14} {s.get('name')}")
+            print(f"  {s.get('index'):<5} {s.get('vtable_offset'):<10} {str(s.get('fn_ea')):<14} {s.get('name')}")
 
 
 def cmd_names(args):
@@ -343,7 +360,11 @@ def cmd_open(args):
 
 def cmd_close(args):
     target = getattr(args, "target", None) or getattr(args, "instance", None)
-    instance = resolve_instance(target=target)
+    try:
+        instance = resolve_instance(target=target)
+    except AmbiguousInstanceError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
     if not instance:
         print("Error: No active IDA Pro instance found to close.", file=sys.stderr)
         sys.exit(1)
@@ -536,20 +557,164 @@ def cmd_xrefs_from(args):
             print(f"  -> {x.get('to')} ({x.get('name')}) [{x.get('type')}] from {x.get('from')}")
 
 
+def _print_exec_result(res, as_json: bool):
+    if as_json:
+        print(json.dumps(res, indent=2))
+        return
+    output = res.get("output", "")
+    stderr = res.get("stderr", "")
+    result = res.get("result")
+    if output:
+        sys.stdout.write(output)
+        if not output.endswith("\n"):
+            sys.stdout.write("\n")
+    if stderr:
+        sys.stderr.write(stderr)
+        if not stderr.endswith("\n"):
+            sys.stderr.write("\n")
+    if result is not None and result != "None":
+        print(result)
+
+
 def cmd_exec(args):
     client = get_client(args.instance)
     res = client.exec_code(args.code)
-    if args.json:
-        print(json.dumps(res, indent=2))
+    _print_exec_result(res, args.json)
+
+
+def cmd_exec_file(args):
+    client = get_client(args.instance)
+    res = client.run_command("exec_file", {"path": args.path})
+    _print_exec_result(res, args.json)
+
+
+def cmd_serve(args):
+    from .mcp_stdio import run_stdio_proxy
+
+    if not getattr(args, "stdio", False):
+        print("Error: specify a transport, e.g. `ida-cli serve --stdio`.", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(run_stdio_proxy(
+        instance_target=getattr(args, "instance", None),
+        port=getattr(args, "port", None),
+    ))
+
+
+def _can_import(module_name: str) -> bool:
+    import importlib.util
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def cmd_doctor(args):
+    """Print environment, dependency, and instance diagnostics."""
+    import ida_cli
+
+    print("ida-cli doctor")
+    print(f"  version        : {__version__}")
+    print(f"  package        : {Path(ida_cli.__file__).parent}")
+    print(f"  python         : {sys.executable}")
+    print(f"  ida_pro_mcp    : {'available' if _can_import('ida_pro_mcp.ida_mcp') else 'missing'}")
+    print(f"  ida_matcher    : {'available' if _can_import('ida_matcher.matcher.match_core') else 'missing'}")
+    print(f"  instances dir  : {get_instances_dir()}")
+
+    try:
+        instances = list_instances(prune_dead=True)
+    except Exception as exc:
+        instances = []
+        print(f"  instances      : error ({exc})")
     else:
-        output = res.get("output", "")
-        result = res.get("result")
-        if output:
-            sys.stdout.write(output)
-            if not output.endswith("\n"):
-                sys.stdout.write("\n")
-        if result is not None and result != "None":
-            print(result)
+        print(f"  instances      : {len(instances)}")
+        for inst in instances:
+            print(f"    - {inst.idb_name} (pid={inst.pid}, port={inst.port}, status={inst.status})")
+
+    print("  env knobs      :")
+    for name, default in (
+        ("IDA_CLI_TOOL_TIMEOUT_SEC", "60"),
+        ("IDA_CLI_HTTP_TIMEOUT_SEC", "120"),
+        ("IDA_CLI_OUTPUT_LIMIT_CHARS", "50000"),
+        ("IDA_CLI_CACHE_TTL_SEC", "60"),
+        ("IDA_CLI_INSTANCES_DIR", str(get_instances_dir())),
+        ("IDA_CLI_QUIET", "0"),
+        ("IDA_MATCHER_URL", "(auto-discover)"),
+    ):
+        print(f"    {name}={os.environ.get(name, '<default ' + default + '>')}")
+
+
+def cmd_install(args):
+    from .installer import get_ida_user_plugins_dir, install
+
+    target = Path(args.ida_plugins_dir) if getattr(args, "ida_plugins_dir", None) else None
+    report = install(target)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"Installed ida-cli connector into {report['ida_plugins_dir']}")
+        for path in report["copied"]:
+            print(f"  + {path}")
+        if report.get("pth"):
+            print(f"  + {report['pth']}")
+        print("Restart IDA (or reload the plugin) to start the connector.")
+
+
+def cmd_uninstall(args):
+    from .installer import uninstall
+
+    target = Path(args.ida_plugins_dir) if getattr(args, "ida_plugins_dir", None) else None
+    report = uninstall(target)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"Removed ida-cli connector from {report['ida_plugins_dir']}")
+        for path in report["removed"]:
+            print(f"  - {path}")
+
+
+def cmd_install_paths(args):
+    from .installer import _repo_root, get_ida_user_plugins_dir
+
+    info = {
+        "repo_root": str(_repo_root()),
+        "plugin_source": str(_repo_root() / "plugin"),
+        "ida_plugins_dir": str(get_ida_user_plugins_dir()),
+    }
+    if args.json:
+        print(json.dumps(info, indent=2))
+    else:
+        for key, value in info.items():
+            print(f"{key}: {value}")
+
+
+def cmd_mcp_config(args):
+    """Emit an MCP client config that drives IDA through ida-cli."""
+    mode = getattr(args, "mode", "stdio")
+    if mode == "proxy":
+        port = None
+        try:
+            instance = resolve_instance(target=getattr(args, "instance", None))
+            port = instance.port if instance else None
+        except AmbiguousInstanceError:
+            port = None
+        if port is None:
+            print("Error: no active ida-cli instance for proxy mode. "
+                  "Start IDA with the connector (or pass -i <port|pid|name>).", file=sys.stderr)
+            sys.exit(1)
+        entry = {
+            "command": sys.executable,
+            "args": ["-m", "ida_pro_mcp.server", "--ida-rpc", f"http://127.0.0.1:{port}"],
+        }
+        note = ("Thin proxy: ida-pro-mcp's stdio server forwards JSON-RPC to "
+                f"ida-cli's /mcp on port {port}.")
+    else:
+        entry = {"command": "ida-cli", "args": ["serve", "--stdio"]}
+        note = "Native: ida-cli speaks MCP directly over stdio."
+
+    config = {"mcpServers": {"ida-cli": entry}}
+    if not args.json:
+        print(f"# {note}")
+    print(json.dumps(config, indent=2))
 
 
 def cmd_list(args):
@@ -616,9 +781,35 @@ def cmd_decompile(args):
             print(json.dumps(res, indent=2))
 
 
+def _print_disasm_lines(lines):
+    for line in lines:
+        addr = line.get("addr", "")
+        insn = line.get("instruction", "")
+        label = line.get("label")
+        if label:
+            print(f"\n{label}:")
+        comments = line.get("comments", [])
+        cmt_str = f"  ; {comments[0]}" if comments else ""
+        print(f"  {addr}:  {insn:<34}{cmt_str}")
+
+
 def cmd_disasm(args):
     client = get_client(args.instance)
     target = resolve_target(client, args.target, prefer_func=True)
+
+    if getattr(args, "chunks", False):
+        res = client.run_command("disasm_chunks", {"addr": target, "max_instructions": args.limit})
+        if args.json:
+            print(json.dumps(res, indent=2))
+            return
+        chunks = res.get("chunks", [])
+        print(f"; Disassembly for {res.get('name', target)} ({res.get('chunk_count', len(chunks))} chunks):")
+        for chunk in chunks:
+            print(f"\n; chunk #{chunk.get('index')} [{chunk.get('kind')}] "
+                  f"{chunk.get('start_ea')}-{chunk.get('end_ea')}")
+            _print_disasm_lines(chunk.get("lines", []))
+        return
+
     params = {
         "addr": target,
         "max_instructions": args.limit,
@@ -633,15 +824,7 @@ def cmd_disasm(args):
         lines = asm.get("lines", [])
         name = asm.get("name", target)
         print(f"; Disassembly for {name} ({len(lines)} instructions):")
-        for line in lines:
-            addr = line.get("addr", "")
-            insn = line.get("instruction", "")
-            label = line.get("label")
-            if label:
-                print(f"\n{label}:")
-            comments = line.get("comments", [])
-            cmt_str = f"  ; {comments[0]}" if comments else ""
-            print(f"  {addr}:  {insn:<34}{cmt_str}")
+        _print_disasm_lines(lines)
 
 
 def cmd_xrefs(args):
@@ -720,7 +903,7 @@ def cmd_funcs(args):
 def cmd_inspect(args):
     client = get_client(args.instance)
     target = resolve_target(client, args.target, prefer_func=True)
-    res = client.run_command("func_inspect", {"target": target})
+    res = client.run_command("func_inspect", {"target": target, "chunks": getattr(args, "chunks", False)})
     data = res.get("data", res)
 
     if args.json:
@@ -730,12 +913,53 @@ def cmd_inspect(args):
         print(f"Size:        {data.get('size')} bytes")
         if data.get("prototype"):
             print(f"Prototype:   {data.get('prototype')}")
+        if data.get("chunks"):
+            print(f"Chunks ({data.get('chunk_count')}):")
+            for chunk in data.get("chunks", []):
+                print(f"  #{chunk.get('index')} [{chunk.get('kind')}] "
+                      f"{chunk.get('start_ea')}-{chunk.get('end_ea')} ({chunk.get('size')}B)")
         print(f"Callers ({data.get('callers_count')} total):")
         for c in data.get("sample_callers", []):
             print(f"  <- {c}")
         print(f"Callees ({data.get('callees_count')} total):")
         for c in data.get("sample_callees", []):
             print(f"  -> {c}")
+
+
+def cmd_analyze(args):
+    client = get_client(args.instance)
+    target = resolve_target(client, args.target, prefer_func=True)
+    res = client.run_command("analyze_function", {"addr": target, "include_asm": getattr(args, "asm", False)})
+    data = res.get("data", res)
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    print(f"Function: {data.get('name')} @ {data.get('addr')}  ({data.get('size')} bytes)")
+    if data.get("prototype"):
+        print(f"Prototype: {data['prototype']}")
+    bb = data.get("basic_blocks") or {}
+    print(f"Blocks: {bb.get('count')}  Complexity: {bb.get('cyclomatic_complexity')}")
+    if data.get("callers"):
+        print("Callers: " + ", ".join(data["callers"]))
+    if data.get("callees"):
+        print("Callees: " + ", ".join(data["callees"]))
+    if data.get("strings"):
+        print("Strings:")
+        for s in data["strings"]:
+            print(f"  {s}")
+    if data.get("constants"):
+        print("Constants: " + ", ".join(str(c.get("value")) for c in data["constants"]))
+    if data.get("decompile_error"):
+        print(f"Decompile error: {data['decompile_error']}")
+    if data.get("decompiled"):
+        print("\n--- pseudocode ---")
+        print(data["decompiled"])
+        if data.get("decompile_truncated"):
+            print(f"... ({data['decompile_truncated']} lines total, truncated)")
+    if data.get("assembly"):
+        print("\n--- asm ---")
+        print(data["assembly"])
 
 
 def cmd_search(args):
@@ -876,7 +1100,27 @@ def cmd_py(args):
             print(result)
 
 
+# Markers unique to the OTHER `ida-cli` project (cpkt9762/ida-cli), which uses
+# `--path`, `raw`/`pipe`, and `serve-http`. This tool never accepts those.
+_FOREIGN_ARG_MARKERS = ("--path", "--compact", "--streamable-http")
+
+
+def _guard_name_collision(argv):
+    for arg in argv:
+        for marker in _FOREIGN_ARG_MARKERS:
+            if arg == marker or arg.startswith(marker + "="):
+                print(
+                    f"Error: '{arg}' belongs to a different 'ida-cli' project "
+                    "(cpkt9762/ida-cli). This tool is the rogan2/ida_cli connector; "
+                    "see `ida-cli --help` for its command set.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+
+
 def main():
+    _guard_name_collision(sys.argv[1:])
+
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument(
         "-i", "--instance",
@@ -962,6 +1206,8 @@ def main():
     p_dis.add_argument("-l", "--limit", type=int, default=50, help="Max instructions (default: 50)")
     p_dis.add_argument("-o", "--offset", type=int, default=0, help="Skip first N instructions")
     p_dis.add_argument("--total", action="store_true", help="Include total instruction count")
+    p_dis.add_argument("--chunks", action="store_true",
+                       help="Disassemble all function chunks (incl. .text$x tail funclets)")
     p_dis.set_defaults(func=cmd_disasm)
 
     # xrefs
@@ -992,7 +1238,15 @@ def main():
     # inspect
     p_inspect = subparsers.add_parser("inspect", parents=[common_parser], help="Inspect a function (summary card)")
     p_inspect.add_argument("target", nargs="?", default="here", help="Function address (e.g. 0x401000) or symbol name (default: cursor)")
+    p_inspect.add_argument("--chunks", action="store_true", help="Also list function chunks (.text$x tails)")
     p_inspect.set_defaults(func=cmd_inspect)
+
+    # analyze (composite function analysis)
+    p_analyze = subparsers.add_parser("analyze", parents=[common_parser],
+                                      help="Composite function analysis (pseudocode, strings, constants, callers/callees, blocks)")
+    p_analyze.add_argument("target", nargs="?", default="here", help="Function address or symbol (default: cursor)")
+    p_analyze.add_argument("--asm", action="store_true", help="Include disassembly")
+    p_analyze.set_defaults(func=cmd_analyze)
 
     # search
     p_search = subparsers.add_parser("search", parents=[common_parser], help="Search text in disassembly or comments")
@@ -1052,6 +1306,48 @@ def main():
     p_py.add_argument("code", help="Python code to evaluate")
     p_py.set_defaults(func=cmd_py)
 
+    # exec-file
+    p_ef = subparsers.add_parser("exec-file", parents=[common_parser],
+                                 help="Execute a Python script file inside IDA (full IDAPython namespace)")
+    p_ef.add_argument("path", help="Path to a .py script")
+    p_ef.set_defaults(func=cmd_exec_file)
+
+    # serve (MCP transport bridge)
+    p_serve = subparsers.add_parser("serve", parents=[common_parser],
+                                    help="Run an MCP transport bridge to IDA")
+    p_serve.add_argument("--stdio", action="store_true",
+                         help="Serve MCP JSON-RPC over stdin/stdout (Claude Desktop/Cursor)")
+    p_serve.add_argument("--port", type=int, default=None,
+                         help="Connect to a specific ida-cli port (default: instance discovery)")
+    p_serve.set_defaults(func=cmd_serve)
+
+    # doctor
+    p_doctor = subparsers.add_parser("doctor", parents=[common_parser],
+                                     help="Diagnose environment, dependencies, and instances")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    # mcp-config
+    p_mcp = subparsers.add_parser("mcp-config", parents=[common_parser],
+                                  help="Emit an MCP client config for connecting to IDA via ida-cli")
+    p_mcp.add_argument("--mode", choices=["stdio", "proxy"], default="stdio",
+                       help="stdio: native ida-cli MCP; proxy: ida-pro-mcp forwards to ida-cli")
+    p_mcp.set_defaults(func=cmd_mcp_config)
+
+    # install / uninstall / install-paths
+    p_install = subparsers.add_parser("install", parents=[common_parser],
+                                      help="Install the connector plugin into IDA Pro's plugins directory")
+    p_install.add_argument("--ida-plugins-dir", default=None, help="Override IDA's user plugins directory")
+    p_install.set_defaults(func=cmd_install)
+
+    p_uninstall = subparsers.add_parser("uninstall", parents=[common_parser],
+                                        help="Remove the connector plugin from IDA Pro's plugins directory")
+    p_uninstall.add_argument("--ida-plugins-dir", default=None, help="Override IDA's user plugins directory")
+    p_uninstall.set_defaults(func=cmd_uninstall)
+
+    p_paths = subparsers.add_parser("install-paths", parents=[common_parser],
+                                    help="Show resolved plugin install paths")
+    p_paths.set_defaults(func=cmd_install_paths)
+
     # struct
     p_struct = subparsers.add_parser("struct", parents=[common_parser], help="Inspect a named struct/class type layout")
     p_struct.add_argument("name", help="Struct/class name (e.g. RGE_Base_Game)")
@@ -1071,9 +1367,10 @@ def main():
     p_locals.set_defaults(func=cmd_locals)
 
     # vtable
-    p_vtable = subparsers.add_parser("vtable", parents=[common_parser], help="Dump vtable slots for a C++ class or vtable address")
+    p_vtable = subparsers.add_parser("vtable", parents=[common_parser], help="Dump MSVC C++ vtable slots for a class or vtable address")
     p_vtable.add_argument("target", help="Class name (e.g. RGE_Player) or vtable address (0x...)")
     p_vtable.add_argument("-l", "--limit", type=int, default=128, help="Max slots (default: 128)")
+    p_vtable.add_argument("--scan", action="store_true", help="Continue past null/non-code slots (secondary/base vtables)")
     p_vtable.set_defaults(func=cmd_vtable)
 
     # names
